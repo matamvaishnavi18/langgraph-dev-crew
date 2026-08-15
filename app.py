@@ -166,5 +166,5 @@ def home():
 add_routes(
     app, 
     workflow, 
-    path="/agent"
+    path="/langgraph"
 )
