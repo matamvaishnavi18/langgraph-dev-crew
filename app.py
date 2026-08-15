@@ -1,10 +1,10 @@
 import sys
 import io
 import traceback
-from typing import TypedDict, List, Optional
+from typing import TypedDict, List, Optional, Any
 
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
@@ -33,7 +33,7 @@ llm = ChatGoogleGenerativeAI(
 )
 
 # ====================================================
-# STATE
+# STATE & SCHEMAS
 # ====================================================
 
 class CrewState(TypedDict):
@@ -42,13 +42,15 @@ class CrewState(TypedDict):
     code: Optional[str]
     report: Optional[str]
 
+class InputSchema(BaseModel):
+    task: str = Field(..., description="Programming task for the AI crew to develop and test.")
+
 # ====================================================
-# TOOLS
+# HELPER FUNCTIONS / TOOLS
 # ====================================================
 
-@tool
 def run_python_code(code: str) -> str:
-    """Execute Python code."""
+    """Executes Python code safely and captures stdout."""
     clean_code = (
         code.replace("```python", "")
         .replace("```", "")
@@ -67,12 +69,11 @@ def run_python_code(code: str) -> str:
     finally:
         sys.stdout = old_stdout
 
-    return result if result else "Success (No Output)"
+    return result if result.strip() else "Success (No Output / Printed Statements)"
 
 
-@tool
 def generate_test_cases(task_description: str) -> str:
-    """Generate test cases."""
+    """Generates 3-5 test scenarios for a given task description."""
     prompt = f"""
 Generate 3-5 Python test scenarios for:
 
@@ -88,13 +89,19 @@ Return only numbered list.
 # ====================================================
 
 def developer_node(state: CrewState):
-    task = state["messages"][-1].content
+    # Retrieve task message
+    messages = state.get("messages", [])
+    if isinstance(messages[-1], BaseMessage):
+        task = messages[-1].content
+    else:
+        task = str(messages[-1])
+
     prompt = f"""
-Write clean Python code for:
+Write clean, executable Python code for:
 
 {task}
 
-Return only code.
+Return ONLY Python code inside backticks. Include print statements to verify output.
 """
     response = llm.invoke(prompt)
     code = response.content if isinstance(response.content, str) else str(response.content)
@@ -102,18 +109,24 @@ Return only code.
 
 
 def tester_node(state: CrewState):
-    task = state["messages"][-1].content
-    tests = generate_test_cases.invoke({"task_description": task})
-    output = run_python_code.invoke({"code": state["code"]})
+    messages = state.get("messages", [])
+    if isinstance(messages[-1], BaseMessage):
+        task = messages[-1].content
+    else:
+        task = str(messages[-1])
+
+    # Direct function execution ensures reliability without tool parsing issues
+    tests = generate_test_cases(task)
+    output = run_python_code(state.get("code", ""))
 
     report = f"""
 ### Generated Code
 
-{state["code"]}
+{state.get('code', '')}
 
 --------------------
 
-### Execution
+### Execution Output
 
 {output}
 
@@ -150,5 +163,8 @@ app = FastAPI(title="AI Coding Crew")
 def home():
     return {"message": "AI Coding Crew Running"}
 
-# Registers /agent and /agent/playground/
-add_routes(app, workflow, path="/agent")
+add_routes(
+    app, 
+    workflow, 
+    path="/agent"
+)
