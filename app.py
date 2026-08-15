@@ -10,12 +10,13 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langserve import add_routes
 
 import os
 import google.generativeai as genai
 
 # ====================================================
-# GOOGLE API KEY
+# GOOGLE API KEY & MODEL INITIALIZATION
 # ====================================================
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -25,12 +26,11 @@ if not GOOGLE_API_KEY:
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
-llm_flash = ChatGoogleGenerativeAI(
-    model="gemini-3.1-flash-lite-preview",
+llm = ChatGoogleGenerativeAI(
+    model="gemini-1.5-flash",
     google_api_key=GOOGLE_API_KEY,
+    temperature=0.2
 )
-
-llm = llm_flash
 
 # ====================================================
 # STATE
@@ -49,7 +49,6 @@ class CrewState(TypedDict):
 @tool
 def run_python_code(code: str) -> str:
     """Execute Python code."""
-
     clean_code = (
         code.replace("```python", "")
         .replace("```", "")
@@ -61,12 +60,10 @@ def run_python_code(code: str) -> str:
     sys.stdout = new_stdout
 
     try:
-        exec(clean_code, {}, {})
+        exec(clean_code, {})
         result = new_stdout.getvalue()
-
     except Exception:
         result = traceback.format_exc()
-
     finally:
         sys.stdout = old_stdout
 
@@ -76,7 +73,6 @@ def run_python_code(code: str) -> str:
 @tool
 def generate_test_cases(task_description: str) -> str:
     """Generate test cases."""
-
     prompt = f"""
 Generate 3-5 Python test scenarios for:
 
@@ -84,20 +80,15 @@ Generate 3-5 Python test scenarios for:
 
 Return only numbered list.
 """
-
     response = llm.invoke(prompt)
-
     return response.content if hasattr(response, "content") else str(response)
-
 
 # ====================================================
 # NODES
 # ====================================================
 
 def developer_node(state: CrewState):
-
     task = state["messages"][-1].content
-
     prompt = f"""
 Write clean Python code for:
 
@@ -105,20 +96,14 @@ Write clean Python code for:
 
 Return only code.
 """
-
     response = llm.invoke(prompt)
-
     code = response.content if isinstance(response.content, str) else str(response.content)
-
     return {"code": code}
 
 
 def tester_node(state: CrewState):
-
     task = state["messages"][-1].content
-
-    tests = generate_test_cases.invoke(task)
-
+    tests = generate_test_cases.invoke({"task_description": task})
     output = run_python_code.invoke({"code": state["code"]})
 
     report = f"""
@@ -138,9 +123,7 @@ def tester_node(state: CrewState):
 
 {tests}
 """
-
     return {"report": report}
-
 
 # ====================================================
 # GRAPH
@@ -158,30 +141,14 @@ graph.add_edge("tester", END)
 workflow = graph.compile()
 
 # ====================================================
-# FASTAPI
+# FASTAPI & LANGSERVE ROUTES
 # ====================================================
 
 app = FastAPI(title="AI Coding Crew")
 
-class TaskRequest(BaseModel):
-    task: str
-
-
 @app.get("/")
 def home():
-    return {
-        "message": "AI Coding Crew Running"
-    }
+    return {"message": "AI Coding Crew Running"}
 
-
-@app.post("/generate")
-def generate(request: TaskRequest):
-
-    result = workflow.invoke({
-        "messages": [HumanMessage(content=request.task)]
-    })
-
-    return {
-        "generated_code": result["code"],
-        "report": result["report"]
-    }
+# Registers /generate and /generate/playground/
+add_routes(app, workflow, path="/generate")
