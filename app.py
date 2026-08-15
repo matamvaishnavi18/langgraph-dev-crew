@@ -1,4 +1,3 @@
-%%writefile app.py
 import sys
 import io
 import traceback
