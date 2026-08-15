@@ -1,3 +1,4 @@
+%%writefile app.py
 import sys
 import io
 import traceback
@@ -150,5 +151,5 @@ app = FastAPI(title="AI Coding Crew")
 def home():
     return {"message": "AI Coding Crew Running"}
 
-# Registers /generate and /generate/playground/
-add_routes(app, workflow, path="/generate")
+# Registers /agent and /agent/playground/
+add_routes(app, workflow, path="/agent")
