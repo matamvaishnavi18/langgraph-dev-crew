@@ -1,28 +1,22 @@
 import sys
 import io
+import os
+import asyncio
 import traceback
-from typing import TypedDict, List, Optional, Any
+from typing import TypedDict, List, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import BaseMessage, HumanMessage
-from langchain_core.tools import tool
-from langgraph.graph import StateGraph, START, END
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, START, END
 from langserve import add_routes
-
-import os
 import google.generativeai as genai
 
-# ====================================================
-# GOOGLE API KEY & MODEL INITIALIZATION
-# ====================================================
-
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
 if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY environment variable not found.")
+    raise ValueError("GOOGLE_API_KEY environment variable missing.")
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
@@ -32,31 +26,16 @@ llm = ChatGoogleGenerativeAI(
     temperature=0.2
 )
 
-# ====================================================
-# STATE & SCHEMAS
-# ====================================================
+class TaskInput(BaseModel):
+    task: str = Field(..., description="Programming task description")
 
 class CrewState(TypedDict):
     messages: List[BaseMessage]
-    next_step: Optional[str]
     code: Optional[str]
     report: Optional[str]
 
-class InputSchema(BaseModel):
-    task: str = Field(..., description="Programming task for the AI crew to develop and test.")
-
-# ====================================================
-# HELPER FUNCTIONS / TOOLS
-# ====================================================
-
 def run_python_code(code: str) -> str:
-    """Executes Python code safely and captures stdout."""
-    clean_code = (
-        code.replace("```python", "")
-        .replace("```", "")
-        .strip()
-    )
-
+    clean_code = code.replace("```python", "").replace("```", "").strip()
     old_stdout = sys.stdout
     new_stdout = io.StringIO()
     sys.stdout = new_stdout
@@ -71,91 +50,37 @@ def run_python_code(code: str) -> str:
 
     return result if result.strip() else "Success (No Output / Printed Statements)"
 
-
-def generate_test_cases(task_description: str) -> str:
-    """Generates 3-5 test scenarios for a given task description."""
-    prompt = f"""
-Generate 3-5 Python test scenarios for:
-
-{task_description}
-
-Return only numbered list.
-"""
-    response = llm.invoke(prompt)
+async def generate_test_cases(task_description: str) -> str:
+    prompt = f"Generate 3-5 Python test scenarios for:\n{task_description}\nReturn only numbered list."
+    response = await llm.ainvoke(prompt)
     return response.content if hasattr(response, "content") else str(response)
 
-# ====================================================
-# NODES
-# ====================================================
-
-def developer_node(state: CrewState):
-    # Retrieve task message
+async def developer_node(state: CrewState):
     messages = state.get("messages", [])
-    if isinstance(messages[-1], BaseMessage):
-        task = messages[-1].content
-    else:
-        task = str(messages[-1])
-
-    prompt = f"""
-Write clean, executable Python code for:
-
-{task}
-
-Return ONLY Python code inside backticks. Include print statements to verify output.
-"""
-    response = llm.invoke(prompt)
+    task = messages[-1].content if messages else "No task provided."
+    prompt = f"Write clean, executable Python code for:\n{task}\nReturn ONLY Python code inside backticks."
+    response = await llm.ainvoke(prompt)
     code = response.content if isinstance(response.content, str) else str(response.content)
     return {"code": code}
 
-
-def tester_node(state: CrewState):
+async def tester_node(state: CrewState):
     messages = state.get("messages", [])
-    if isinstance(messages[-1], BaseMessage):
-        task = messages[-1].content
-    else:
-        task = str(messages[-1])
-
-    # Direct function execution ensures reliability without tool parsing issues
-    tests = generate_test_cases(task)
+    task = messages[-1].content if messages else "No task provided."
+    tests = await generate_test_cases(task)
     output = run_python_code(state.get("code", ""))
 
-    report = f"""
-### Generated Code
-
-{state.get('code', '')}
-
---------------------
-
-### Execution Output
-
-{output}
-
---------------------
-
-### Test Cases
-
-{tests}
-"""
+    report = f"### Generated Code\n{state.get('code', '')}\n\n---\n\n### Execution Output\n{output}\n\n---\n\n### Test Cases\n{tests}"
     return {"report": report}
 
-# ====================================================
-# GRAPH
-# ====================================================
-
 graph = StateGraph(CrewState)
-
 graph.add_node("developer", developer_node)
 graph.add_node("tester", tester_node)
-
 graph.add_edge(START, "developer")
 graph.add_edge("developer", "tester")
 graph.add_edge("tester", END)
-
 workflow = graph.compile()
 
-# ====================================================
-# FASTAPI & LANGSERVE ROUTES
-# ====================================================
+runnable_chain = (lambda x: {"messages": [HumanMessage(content=x["task"])]}) | workflow
 
 app = FastAPI(title="AI Coding Crew")
 
@@ -164,7 +89,12 @@ def home():
     return {"message": "AI Coding Crew Running"}
 
 add_routes(
-    app, 
-    workflow, 
-    path="/langgraph"
+    app,
+    runnable_chain.with_types(input_type=TaskInput, output_type=dict),
+    path="/agent"
 )
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
