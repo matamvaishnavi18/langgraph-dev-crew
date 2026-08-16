@@ -14,6 +14,11 @@ from langgraph.graph import StateGraph, START, END
 from langserve import add_routes
 import google.generativeai as genai
 
+
+# ============================================================
+# 1. API KEY & MODEL INITIALIZATION
+# ============================================================
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY environment variable missing.")
@@ -26,13 +31,26 @@ llm = ChatGoogleGenerativeAI(
     temperature=0.2
 )
 
+
+# ============================================================
+# 2. SCHEMAS (INPUT & OUTPUT)
+# ============================================================
+
 class TaskInput(BaseModel):
     task: str = Field(..., description="Programming task description")
+
+class TaskOutput(BaseModel):
+    report: str = Field(..., description="Final execution & test report")
 
 class CrewState(TypedDict):
     messages: List[BaseMessage]
     code: Optional[str]
     report: Optional[str]
+
+
+# ============================================================
+# 3. HELPER FUNCTIONS & NODES
+# ============================================================
 
 def run_python_code(code: str) -> str:
     clean_code = code.replace("```python", "").replace("```", "").strip()
@@ -50,10 +68,12 @@ def run_python_code(code: str) -> str:
 
     return result if result.strip() else "Success (No Output / Printed Statements)"
 
+
 async def generate_test_cases(task_description: str) -> str:
     prompt = f"Generate 3-5 Python test scenarios for:\n{task_description}\nReturn only numbered list."
     response = await llm.ainvoke(prompt)
     return response.content if hasattr(response, "content") else str(response)
+
 
 async def developer_node(state: CrewState):
     messages = state.get("messages", [])
@@ -63,14 +83,24 @@ async def developer_node(state: CrewState):
     code = response.content if isinstance(response.content, str) else str(response.content)
     return {"code": code}
 
+
 async def tester_node(state: CrewState):
     messages = state.get("messages", [])
     task = messages[-1].content if messages else "No task provided."
     tests = await generate_test_cases(task)
     output = run_python_code(state.get("code", ""))
 
-    report = f"### Generated Code\n{state.get('code', '')}\n\n---\n\n### Execution Output\n{output}\n\n---\n\n### Test Cases\n{tests}"
+    report = (
+        f"### Generated Code\n{state.get('code', '')}\n\n"
+        f"---\n\n### Execution Output\n{output}\n\n"
+        f"---\n\n### Test Cases\n{tests}"
+    )
     return {"report": report}
+
+
+# ============================================================
+# 4. BUILD LANGGRAPH & RUNNABLE CHAIN
+# ============================================================
 
 graph = StateGraph(CrewState)
 graph.add_node("developer", developer_node)
@@ -80,7 +110,17 @@ graph.add_edge("developer", "tester")
 graph.add_edge("tester", END)
 workflow = graph.compile()
 
-runnable_chain = (lambda x: {"messages": [HumanMessage(content=x["task"])]}) | workflow
+# Extract only the "report" key so LangServe can render it in the main Output box
+runnable_chain = (
+    (lambda x: {"messages": [HumanMessage(content=x["task"])]}) 
+    | workflow 
+    | (lambda state: {"report": state.get("report", "No report generated.")})
+)
+
+
+# ============================================================
+# 5. FASTAPI & LANGSERVE ROUTES
+# ============================================================
 
 app = FastAPI(title="AI Coding Crew")
 
@@ -90,9 +130,14 @@ def home():
 
 add_routes(
     app,
-    runnable_chain.with_types(input_type=TaskInput, output_type=dict),
+    runnable_chain.with_types(input_type=TaskInput, output_type=TaskOutput),
     path="/agent"
 )
+
+
+# ============================================================
+# 6. SERVER ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
